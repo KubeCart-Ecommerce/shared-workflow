@@ -1,7 +1,5 @@
 name: MERN Microservice Reusable CI
 
-# This reusable workflow lives in the shared workflow repository.
-# Service repositories call it with "uses:" from their own workflow file.
 on:
   workflow_call:
     inputs:
@@ -42,7 +40,7 @@ env:
 
 jobs:
   setup:
-    name: 1. Setup And Build
+    name: Setup And Build
     runs-on: ubuntu-latest
 
     steps:
@@ -74,7 +72,7 @@ jobs:
           fi
 
   sonar:
-    name: 2. SonarQube Scan
+    name: SonarQube Scan
     runs-on: ubuntu-latest
     needs: setup
 
@@ -94,7 +92,7 @@ jobs:
           SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
 
   snyk:
-    name: 3. Snyk Scan
+    name: Snyk Scan
     runs-on: ubuntu-latest
     needs: setup
 
@@ -133,7 +131,7 @@ jobs:
           exit 1
 
   docker-build:
-    name: 4. Docker Build And Push
+    name: Docker Build And Push
     runs-on: ubuntu-latest
     needs: snyk
     outputs:
@@ -142,13 +140,11 @@ jobs:
       image_uri: ${{ steps.image.outputs.image_name }}:${{ steps.tag.outputs.image_tag }}
 
     steps:
-      # Docker needs the repository files and Dockerfile.
       - name: Checkout Code
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      # Login to GitHub Container Registry.
       - name: Docker Login To GHCR
         uses: docker/login-action@v3
         with:
@@ -156,97 +152,129 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ github.token }}
 
-      # The Docker image name is based on the repository name.
       - name: Set Image Name
         id: image
-        shell: bash
         run: |
           IMAGE_REPOSITORY="${GITHUB_REPOSITORY,,}"
           echo "image_name=ghcr.io/$IMAGE_REPOSITORY" >> "$GITHUB_OUTPUT"
 
-      # For dev, use the commit SHA as the Docker tag.
       - name: Set DEV Image Tag
         if: ${{ env.BRANCH_NAME == 'dev' }}
         run: echo "IMAGE_TAG=${{ env.COMMIT_SHA }}" >> "$GITHUB_ENV"
 
-      # For main, create a GitHub tag from conventional commit messages.
       - name: GitHub Tag
         if: ${{ env.BRANCH_NAME == 'main' }}
         id: tag_version
         uses: mathieudutour/github-tag-action@v6.2
-        with:
-          github_token: ${{ github.token }}
-          tag_prefix: "v"
-          release_branches: "main"
-          default_bump: "patch"
 
       - name: Set MAIN Image Tag
         if: ${{ env.BRANCH_NAME == 'main' }}
         run: echo "IMAGE_TAG=${{ steps.tag_version.outputs.new_version }}" >> "$GITHUB_ENV"
 
-      # Save the final tag as a job output for the Trivy job.
       - name: Save Image Tag
         id: tag
         run: echo "image_tag=${{ env.IMAGE_TAG }}" >> "$GITHUB_OUTPUT"
 
-      # Skip Docker build when this exact image tag already exists in GHCR.
       - name: Check If Image Already Exists In GHCR
         id: image_check
-        shell: bash
         run: |
           if docker manifest inspect "${{ steps.image.outputs.image_name }}:${{ steps.tag.outputs.image_tag }}" > /dev/null 2>&1; then
             echo "exists=true" >> "$GITHUB_OUTPUT"
-            echo "Image already exists."
           else
             echo "exists=false" >> "$GITHUB_OUTPUT"
-            echo "Image does not exist yet."
           fi
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      # Build and push the Docker image only when it does not already exist.
-      - name: Docker Build And Push
+      # BUILD ONLY (NO PUSH)
+      - name: Docker Build (No Push)
         if: ${{ steps.image_check.outputs.exists == 'false' }}
         uses: docker/build-push-action@v6
         with:
           context: ${{ inputs['docker-context'] }}
           file: ${{ inputs.dockerfile }}
-          push: true
+          push: false
+          load: true
           tags: ${{ steps.image.outputs.image_name }}:${{ steps.tag.outputs.image_tag }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+      # Save image for next jobs
+      - name: Save Docker Image As Artifact
+        if: ${{ steps.image_check.outputs.exists == 'false' }}
+        run: |
+          docker save ${{ steps.image.outputs.image_name }}:${{ steps.tag.outputs.image_tag }} -o image.tar
+
+      - name: Upload Image Artifact
+        if: ${{ steps.image_check.outputs.exists == 'false' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: docker-image-${{ env.COMMIT_SHA }}
+          path: image.tar
+
   trivy:
-    name: 5. Trivy Image Scan
+    name: Trivy Image Scan
     runs-on: ubuntu-latest
     needs: docker-build
 
     steps:
-      # DEV fails on HIGH and CRITICAL vulnerabilities.
+      # Get built image
+      - name: Download Image Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: docker-image-${{ env.COMMIT_SHA }}
+
+      - name: Load Docker Image
+        run: docker load -i image.tar
+
       - name: Trivy Scan - DEV Fails On Vulnerabilities
         if: ${{ env.BRANCH_NAME == 'dev' }}
         uses: aquasecurity/trivy-action@0.20.0
         with:
           image-ref: ${{ needs['docker-build'].outputs.image_uri }}
-          format: table
-          vuln-type: os,library
           severity: HIGH,CRITICAL
           exit-code: "1"
 
-      # MAIN records vulnerabilities but does not fail the pipeline.
       - name: Trivy Scan - MAIN Does Not Fail
         if: ${{ env.BRANCH_NAME == 'main' }}
-        uses: aquasecurity/trivy-action@0.30.0
+        uses: aquasecurity/trivy-action@0.20.0
         with:
           image-ref: ${{ needs['docker-build'].outputs.image_uri }}
-          format: table
-          vuln-type: os,library
           severity: HIGH,CRITICAL
           exit-code: "0"
 
+  docker-push:
+    name: Docker Push (Post Scan)
+    runs-on: ubuntu-latest
+    needs: [docker-build, trivy]
+
+    # Fail-fast logic enforced here
+    if: ${{ needs.docker-build.result == 'success' }}
+
+    steps:
+      - name: Docker Login To GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Download Image Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: docker-image-${{ env.COMMIT_SHA }}
+
+      - name: Load Docker Image
+        run: docker load -i image.tar
+
+      # PUSH ONLY AFTER TRIVY
+      - name: Push Image
+        run: |
+          docker push ${{ needs.docker-build.outputs.image_uri }}
+
   notify:
-    name: 6. Slack Notification
+    name: Slack Notification
     runs-on: ubuntu-latest
     needs: [setup, sonar, snyk, docker-build, trivy]
     if: ${{ always() && (github.base_ref == 'main' || github.ref_name == 'main' || ((github.base_ref == 'dev' || github.ref_name == 'dev') && contains(join(needs.*.result, ','), 'failure'))) }}
