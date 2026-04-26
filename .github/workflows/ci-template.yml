@@ -1,7 +1,7 @@
 name: MERN Microservice Reusable CI
 
-# Put this reusable workflow in the shared workflow repository.
-# GitHub executes reusable workflows from: .github/workflows/ci-template.yml
+# This reusable workflow lives in the shared workflow repository.
+# Service repositories call it with "uses:" from their own workflow file.
 on:
   workflow_call:
     inputs:
@@ -31,37 +31,39 @@ on:
         required: true
 
 permissions:
-  contents: read
+  contents: write
   packages: write
 
+env:
+  NODE_VERSION: ${{ inputs['node-version'] }}
+  BRANCH_NAME: ${{ github.base_ref || github.ref_name }}
+  REPO_NAME: ${{ github.event.repository.name }}
+  COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+
 jobs:
-  ci:
-    name: Build, Scan, and Push
+  setup:
+    name: 1. Setup And Build
     runs-on: ubuntu-latest
-    env:
-      BRANCH_NAME: ${{ github.base_ref || github.ref_name }}
-      REPO_NAME: ${{ github.event.repository.name }}
-      COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
 
     steps:
-      # 1. Download the service repository code.
+      # Download the service repository code.
       - name: Checkout Code
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      # 2. Install Node.js 18 for MERN services.
+      # Install Node.js 18 for MERN services.
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: ${{ inputs.node-version }}
+          node-version: ${{ env.NODE_VERSION }}
           cache: npm
 
-      # 3. Install npm dependencies.
+      # Install npm dependencies.
       - name: Install Dependencies
         run: npm install
 
-      # 4. Build only when the repository has a build script.
+      # Build only when the repository has a build script.
       - name: Build If Build Script Exists
         shell: bash
         run: |
@@ -71,7 +73,19 @@ jobs:
             echo "No build script found. Skipping build."
           fi
 
-      # 5. Run SonarQube, but do not fail the pipeline if SonarQube finds issues.
+  sonar:
+    name: 2. SonarQube Scan
+    runs-on: ubuntu-latest
+    needs: setup
+
+    steps:
+      # Each job gets a fresh runner, so checkout is needed again.
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # SonarQube should run, but it must not fail this CI pipeline.
       - name: SonarQube Scan
         uses: SonarSource/sonarqube-scan-action@v5
         continue-on-error: true
@@ -79,8 +93,20 @@ jobs:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
           SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
 
-      # 6. Run Snyk dependency scan.
-      # Snyk may fail, but we decide later whether that should fail the workflow.
+  snyk:
+    name: 3. Snyk Scan
+    runs-on: ubuntu-latest
+    needs: setup
+
+    steps:
+      # Snyk needs the repository files and package manifests.
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # Run Snyk dependency scan.
+      # It is allowed to fail here so we can apply dev/main rules in the next step.
       - name: Snyk Scan
         id: snyk
         uses: snyk/actions/node@master
@@ -90,7 +116,7 @@ jobs:
         with:
           args: --all-projects --json-file-output=snyk-report.json
 
-      # Save the Snyk report so it can be downloaded from the workflow run.
+      # Upload the Snyk report from this job as a workflow artifact.
       - name: Upload Snyk Report
         uses: actions/upload-artifact@v4
         with:
@@ -99,13 +125,30 @@ jobs:
           if-no-files-found: warn
 
       # DEV rule: fail when Snyk finds dependency issues.
+      # MAIN rule: do not fail because of Snyk vulnerabilities.
       - name: Fail On Snyk Issues In DEV
         if: ${{ env.BRANCH_NAME == 'dev' && steps.snyk.outcome == 'failure' }}
         run: |
           echo "Snyk found issues on dev. Failing the pipeline."
           exit 1
 
-      # 7. Login to GitHub Container Registry.
+  docker-build:
+    name: 4. Docker Build And Push
+    runs-on: ubuntu-latest
+    needs: snyk
+    outputs:
+      image_name: ${{ steps.image.outputs.image_name }}
+      image_tag: ${{ steps.tag.outputs.image_tag }}
+      image_uri: ${{ steps.image.outputs.image_name }}:${{ steps.tag.outputs.image_tag }}
+
+    steps:
+      # Docker needs the repository files and Dockerfile.
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # Login to GitHub Container Registry.
       - name: Docker Login To GHCR
         uses: docker/login-action@v3
         with:
@@ -113,83 +156,101 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ github.token }}
 
-      # 8. The Docker image name is based on the repository name.
+      # The Docker image name is based on the repository name.
       - name: Set Image Name
+        id: image
         shell: bash
         run: |
           IMAGE_REPOSITORY="${GITHUB_REPOSITORY,,}"
-          echo "IMAGE_NAME=ghcr.io/$IMAGE_REPOSITORY" >> "$GITHUB_ENV"
+          echo "image_name=ghcr.io/$IMAGE_REPOSITORY" >> "$GITHUB_OUTPUT"
 
-      # 9. For dev, use the commit SHA as the Docker tag.
+      # For dev, use the commit SHA as the Docker tag.
       - name: Set DEV Image Tag
         if: ${{ env.BRANCH_NAME == 'dev' }}
         run: echo "IMAGE_TAG=${{ env.COMMIT_SHA }}" >> "$GITHUB_ENV"
 
-      # 9. For main, calculate a semantic version from commit messages.
-      - name: Create MAIN Semantic Version
+      # For main, create a GitHub tag from conventional commit messages.
+      - name: GitHub Tag
         if: ${{ env.BRANCH_NAME == 'main' }}
-        id: semver
-        uses: paulhatch/semantic-version@v5.4.0
+        id: tag_version
+        uses: mathieudutour/github-tag-action@v6.2
         with:
+          github_token: ${{ github.token }}
           tag_prefix: "v"
-          major_pattern: "BREAKING CHANGE"
-          minor_pattern: "feat:"
-          version_format: "${major}.${minor}.${patch}"
+          release_branches: "main"
+          default_bump: "patch"
 
       - name: Set MAIN Image Tag
         if: ${{ env.BRANCH_NAME == 'main' }}
-        run: echo "IMAGE_TAG=${{ steps.semver.outputs.version }}" >> "$GITHUB_ENV"
+        run: echo "IMAGE_TAG=${{ steps.tag_version.outputs.new_version }}" >> "$GITHUB_ENV"
 
-      # 10. Skip Docker build when this exact image tag already exists in GHCR.
+      # Save the final tag as a job output for the Trivy job.
+      - name: Save Image Tag
+        id: tag
+        run: echo "image_tag=${{ env.IMAGE_TAG }}" >> "$GITHUB_OUTPUT"
+
+      # Skip Docker build when this exact image tag already exists in GHCR.
       - name: Check If Image Already Exists In GHCR
-        id: image-check
+        id: image_check
         shell: bash
         run: |
-          if docker manifest inspect "$IMAGE_NAME:$IMAGE_TAG" > /dev/null 2>&1; then
+          if docker manifest inspect "${{ steps.image.outputs.image_name }}:${{ steps.tag.outputs.image_tag }}" > /dev/null 2>&1; then
             echo "exists=true" >> "$GITHUB_OUTPUT"
-            echo "Image already exists: $IMAGE_NAME:$IMAGE_TAG"
+            echo "Image already exists."
           else
             echo "exists=false" >> "$GITHUB_OUTPUT"
-            echo "Image does not exist yet: $IMAGE_NAME:$IMAGE_TAG"
+            echo "Image does not exist yet."
           fi
 
-      # 11. Build and push the Docker image only when it does not already exist.
+      # Build and push the Docker image only when it does not already exist.
       - name: Docker Build And Push
-        if: ${{ steps.image-check.outputs.exists == 'false' }}
+        if: ${{ steps.image_check.outputs.exists == 'false' }}
         uses: docker/build-push-action@v6
         with:
-          context: ${{ inputs.docker-context }}
+          context: ${{ inputs['docker-context'] }}
           file: ${{ inputs.dockerfile }}
           push: true
-          tags: ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
+          tags: ${{ steps.image.outputs.image_name }}:${{ steps.tag.outputs.image_tag }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      # 12. Scan the final Docker image with Trivy.
-      # DEV fails on vulnerabilities. MAIN records results but does not fail.
+  trivy:
+    name: 5. Trivy Image Scan
+    runs-on: ubuntu-latest
+    needs: docker-build
+
+    steps:
+      # DEV fails on HIGH and CRITICAL vulnerabilities.
       - name: Trivy Scan - DEV Fails On Vulnerabilities
         if: ${{ env.BRANCH_NAME == 'dev' }}
-        uses: aquasecurity/trivy-action@v0.36.0
+        uses: aquasecurity/trivy-action@0.30.0
         with:
-          image-ref: ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
+          image-ref: ${{ needs['docker-build'].outputs.image_uri }}
           format: table
           vuln-type: os,library
           severity: HIGH,CRITICAL
           exit-code: "1"
 
+      # MAIN records vulnerabilities but does not fail the pipeline.
       - name: Trivy Scan - MAIN Does Not Fail
         if: ${{ env.BRANCH_NAME == 'main' }}
-        uses: aquasecurity/trivy-action@v0.36.0
+        uses: aquasecurity/trivy-action@0.30.0
         with:
-          image-ref: ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
+          image-ref: ${{ needs['docker-build'].outputs.image_uri }}
           format: table
           vuln-type: os,library
           severity: HIGH,CRITICAL
           exit-code: "0"
 
-      # 13. DEV sends Slack only on failure. MAIN sends Slack on success or failure.
+  notify:
+    name: 6. Slack Notification
+    runs-on: ubuntu-latest
+    needs: [setup, sonar, snyk, docker-build, trivy]
+    if: ${{ always() && (github.base_ref == 'main' || github.ref_name == 'main' || ((github.base_ref == 'dev' || github.ref_name == 'dev') && contains(join(needs.*.result, ','), 'failure'))) }}
+
+    steps:
+      # DEV sends Slack only on failure. MAIN sends Slack on success or failure.
       - name: Slack Notification
-        if: ${{ always() && (env.BRANCH_NAME == 'main' || (env.BRANCH_NAME == 'dev' && failure())) }}
         uses: slackapi/slack-github-action@v1.27.0
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
@@ -199,13 +260,13 @@ jobs:
             {
               "attachments": [
                 {
-                  "color": "${{ job.status == 'success' && '#2eb67d' || '#e01e5a' }}",
+                  "color": "${{ contains(join(needs.*.result, ','), 'failure') && '#e01e5a' || '#2eb67d' }}",
                   "blocks": [
                     {
                       "type": "header",
                       "text": {
                         "type": "plain_text",
-                        "text": "CI Pipeline: ${{ job.status }}"
+                        "text": "CI Pipeline: ${{ contains(join(needs.*.result, ','), 'failure') && 'failure' || 'success' }}"
                       }
                     },
                     {
@@ -221,7 +282,7 @@ jobs:
                         },
                         {
                           "type": "mrkdwn",
-                          "text": "*Status:*\n${{ job.status }}"
+                          "text": "*Status:*\n${{ contains(join(needs.*.result, ','), 'failure') && 'failure' || 'success' }}"
                         },
                         {
                           "type": "mrkdwn",
