@@ -254,7 +254,7 @@ jobs:
 
       - name: Trivy Scan - DEV Fails On Vulnerabilities
         if: ${{ env.BRANCH_NAME == 'dev' }}
-        uses: aquasecurity/trivy-action@0.20.0
+        uses: aquasecurity/trivy-action@master
         with:
           image-ref: ${{ needs['docker-build'].outputs.image_uri }}
           severity: HIGH,CRITICAL
@@ -262,7 +262,7 @@ jobs:
 
       - name: Trivy Scan - MAIN Does Not Fail
         if: ${{ env.BRANCH_NAME == 'main' }}
-        uses: aquasecurity/trivy-action@0.20.0
+        uses: aquasecurity/trivy-action@master
         with:
           image-ref: ${{ needs['docker-build'].outputs.image_uri }}
           severity: HIGH,CRITICAL
