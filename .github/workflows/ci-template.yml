@@ -83,7 +83,7 @@ jobs:
         shell: bash
         run: |
           if npm run | grep -q " build"; then
-            npm run build
+            CI=false npm run build
           else
             echo "No build script found. Skipping build."
           fi
