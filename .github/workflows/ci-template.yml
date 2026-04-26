@@ -226,7 +226,7 @@ jobs:
       # DEV fails on HIGH and CRITICAL vulnerabilities.
       - name: Trivy Scan - DEV Fails On Vulnerabilities
         if: ${{ env.BRANCH_NAME == 'dev' }}
-        uses: aquasecurity/trivy-action@0.30.0
+        uses: aquasecurity/trivy-action@0.20.0
         with:
           image-ref: ${{ needs['docker-build'].outputs.image_uri }}
           format: table
