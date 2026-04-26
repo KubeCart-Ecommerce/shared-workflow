@@ -27,6 +27,23 @@ on:
         required: true
       SLACK_WEBHOOK_URL:
         required: true
+  workflow_dispatch:
+    inputs:
+      node-version:
+        description: Node.js version used by MERN services.
+        required: false
+        type: string
+        default: "18"
+      docker-context:
+        description: Docker build context.
+        required: false
+        type: string
+        default: "."
+      dockerfile:
+        description: Dockerfile path.
+        required: false
+        type: string
+        default: "Dockerfile"
 
 permissions:
   contents: write
