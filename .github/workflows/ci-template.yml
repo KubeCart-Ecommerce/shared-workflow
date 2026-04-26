@@ -169,7 +169,7 @@ jobs:
       # DEV fails on vulnerabilities. MAIN records results but does not fail.
       - name: Trivy Scan - DEV Fails On Vulnerabilities
         if: ${{ env.BRANCH_NAME == 'dev' }}
-        uses: aquasecurity/trivy-action@v4
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           image-ref: ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
           format: table
@@ -179,7 +179,7 @@ jobs:
 
       - name: Trivy Scan - MAIN Does Not Fail
         if: ${{ env.BRANCH_NAME == 'main' }}
-        uses: aquasecurity/trivy-action@v4
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           image-ref: ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
           format: table
