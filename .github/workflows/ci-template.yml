@@ -1,0 +1,235 @@
+name: MERN Microservice Reusable CI
+
+# Put this reusable workflow in the shared workflow repository.
+# GitHub executes reusable workflows from: .github/workflows/ci-template.yml
+on:
+  workflow_call:
+    inputs:
+      node-version:
+        description: Node.js version used by MERN services.
+        required: false
+        type: string
+        default: "18"
+      docker-context:
+        description: Docker build context.
+        required: false
+        type: string
+        default: "."
+      dockerfile:
+        description: Dockerfile path.
+        required: false
+        type: string
+        default: "Dockerfile"
+    secrets:
+      SONAR_TOKEN:
+        required: true
+      SONAR_HOST_URL:
+        required: true
+      SNYK_TOKEN:
+        required: true
+      SLACK_WEBHOOK_URL:
+        required: true
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  ci:
+    name: Build, Scan, and Push
+    runs-on: ubuntu-latest
+    env:
+      BRANCH_NAME: ${{ github.base_ref || github.ref_name }}
+      REPO_NAME: ${{ github.event.repository.name }}
+      COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+
+    steps:
+      # 1. Download the service repository code.
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # 2. Install Node.js 18 for MERN services.
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: npm
+
+      # 3. Install npm dependencies.
+      - name: Install Dependencies
+        run: npm install
+
+      # 4. Build only when the repository has a build script.
+      - name: Build If Build Script Exists
+        shell: bash
+        run: |
+          if npm run | grep -q " build"; then
+            npm run build
+          else
+            echo "No build script found. Skipping build."
+          fi
+
+      # 5. Run SonarQube, but do not fail the pipeline if SonarQube finds issues.
+      - name: SonarQube Scan
+        uses: SonarSource/sonarqube-scan-action@v5
+        continue-on-error: true
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+
+      # 6. Run Snyk dependency scan.
+      # Snyk may fail, but we decide later whether that should fail the workflow.
+      - name: Snyk Scan
+        id: snyk
+        uses: snyk/actions/node@master
+        continue-on-error: true
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        with:
+          args: --all-projects --json-file-output=snyk-report.json
+
+      # Save the Snyk report so it can be downloaded from the workflow run.
+      - name: Upload Snyk Report
+        uses: actions/upload-artifact@v4
+        with:
+          name: snyk-report-${{ env.REPO_NAME }}-${{ env.COMMIT_SHA }}
+          path: snyk-report.json
+          if-no-files-found: warn
+
+      # DEV rule: fail when Snyk finds dependency issues.
+      - name: Fail On Snyk Issues In DEV
+        if: ${{ env.BRANCH_NAME == 'dev' && steps.snyk.outcome == 'failure' }}
+        run: |
+          echo "Snyk found issues on dev. Failing the pipeline."
+          exit 1
+
+      # 7. Login to GitHub Container Registry.
+      - name: Docker Login To GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      # 8. The Docker image name is based on the repository name.
+      - name: Set Image Name
+        shell: bash
+        run: |
+          IMAGE_REPOSITORY="${GITHUB_REPOSITORY,,}"
+          echo "IMAGE_NAME=ghcr.io/$IMAGE_REPOSITORY" >> "$GITHUB_ENV"
+
+      # 9. For dev, use the commit SHA as the Docker tag.
+      - name: Set DEV Image Tag
+        if: ${{ env.BRANCH_NAME == 'dev' }}
+        run: echo "IMAGE_TAG=${{ env.COMMIT_SHA }}" >> "$GITHUB_ENV"
+
+      # 9. For main, calculate a semantic version from commit messages.
+      - name: Create MAIN Semantic Version
+        if: ${{ env.BRANCH_NAME == 'main' }}
+        id: semver
+        uses: paulhatch/semantic-version@v5.4.0
+        with:
+          tag_prefix: "v"
+          major_pattern: "BREAKING CHANGE"
+          minor_pattern: "feat:"
+          version_format: "${major}.${minor}.${patch}"
+
+      - name: Set MAIN Image Tag
+        if: ${{ env.BRANCH_NAME == 'main' }}
+        run: echo "IMAGE_TAG=${{ steps.semver.outputs.version }}" >> "$GITHUB_ENV"
+
+      # 10. Skip Docker build when this exact image tag already exists in GHCR.
+      - name: Check If Image Already Exists In GHCR
+        id: image-check
+        shell: bash
+        run: |
+          if docker manifest inspect "$IMAGE_NAME:$IMAGE_TAG" > /dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "Image already exists: $IMAGE_NAME:$IMAGE_TAG"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "Image does not exist yet: $IMAGE_NAME:$IMAGE_TAG"
+          fi
+
+      # 11. Build and push the Docker image only when it does not already exist.
+      - name: Docker Build And Push
+        if: ${{ steps.image-check.outputs.exists == 'false' }}
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ inputs.docker-context }}
+          file: ${{ inputs.dockerfile }}
+          push: true
+          tags: ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # 12. Scan the final Docker image with Trivy.
+      # DEV fails on vulnerabilities. MAIN records results but does not fail.
+      - name: Trivy Scan - DEV Fails On Vulnerabilities
+        if: ${{ env.BRANCH_NAME == 'dev' }}
+        uses: aquasecurity/trivy-action@0.30.0
+        with:
+          image-ref: ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
+          format: table
+          vuln-type: os,library
+          severity: HIGH,CRITICAL
+          exit-code: "1"
+
+      - name: Trivy Scan - MAIN Does Not Fail
+        if: ${{ env.BRANCH_NAME == 'main' }}
+        uses: aquasecurity/trivy-action@0.30.0
+        with:
+          image-ref: ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
+          format: table
+          vuln-type: os,library
+          severity: HIGH,CRITICAL
+          exit-code: "0"
+
+      # 13. DEV sends Slack only on failure. MAIN sends Slack on success or failure.
+      - name: Slack Notification
+        if: ${{ always() && (env.BRANCH_NAME == 'main' || (env.BRANCH_NAME == 'dev' && failure())) }}
+        uses: slackapi/slack-github-action@v1.27.0
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK
+        with:
+          payload: |
+            {
+              "attachments": [
+                {
+                  "color": "${{ job.status == 'success' && '#2eb67d' || '#e01e5a' }}",
+                  "blocks": [
+                    {
+                      "type": "header",
+                      "text": {
+                        "type": "plain_text",
+                        "text": "CI Pipeline: ${{ job.status }}"
+                      }
+                    },
+                    {
+                      "type": "section",
+                      "fields": [
+                        {
+                          "type": "mrkdwn",
+                          "text": "*Repository:*\n${{ github.repository }}"
+                        },
+                        {
+                          "type": "mrkdwn",
+                          "text": "*Branch:*\n${{ env.BRANCH_NAME }}"
+                        },
+                        {
+                          "type": "mrkdwn",
+                          "text": "*Status:*\n${{ job.status }}"
+                        },
+                        {
+                          "type": "mrkdwn",
+                          "text": "*Commit SHA:*\n${{ env.COMMIT_SHA }}"
+                        }
+                      ]
+                    }
+                  ]
+                }
+              ]
+            }
