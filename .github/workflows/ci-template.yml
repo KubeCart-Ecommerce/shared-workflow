@@ -166,6 +166,8 @@ jobs:
         if: ${{ env.BRANCH_NAME == 'main' }}
         id: tag_version
         uses: mathieudutour/github-tag-action@v6.2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Set MAIN Image Tag
         if: ${{ env.BRANCH_NAME == 'main' }}
