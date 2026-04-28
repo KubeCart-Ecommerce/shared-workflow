@@ -92,18 +92,26 @@ jobs:
     name: SonarQube Scan
     runs-on: ubuntu-latest
     needs: setup
-
+  
     steps:
-      # Each job gets a fresh runner, so checkout is needed again
       - name: Checkout Code
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-
-      
+  
+      # Generate dynamic project key (org/repo → org_repo)
+      - name: Generate Project Key
+        id: vars
+        run: |
+          echo "PROJECT_KEY=$(echo '${{ github.repository }}' | tr '/' '_')" >> $GITHUB_OUTPUT
+  
       - name: SonarQube Scan
-        uses: SonarSource/sonarqube-scan-action@v5
-        continue-on-error: true
+        uses: SonarSource/sonarqube-scan-action@v6
+        with:
+          args: >
+            -Dsonar.projectKey=${{ steps.vars.outputs.PROJECT_KEY }}
+            -Dsonar.projectName=${{ github.event.repository.name }}
+            -Dsonar.sources=.
         env:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
           SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
